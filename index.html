@@ -1021,9 +1021,9 @@ id="page-notifications">
     </div>
     <div class="form-group">
       <label class="form-label">Invite Code *</label>
-      <input class="form-input" id="join-flat-code" placeholder="e.g. AB12CD" style="text-transform:uppercase;letter-spacing:2px;font-size:16px;font-weight:600" onkeydown="if(event.key==='Enter')joinFlat()"/>
+      <input class="form-input" id="join-flat-code" placeholder="Paste join link or 6-char code" style="font-size:13px" onkeydown="if(event.key==='Enter')joinFlat()"/>
     </div>
-    <div style="font-size:12px;color:var(--text2);margin-bottom:16px">Ask the flat owner for the 6-character invite code.</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:16px">Paste the join link shared by the flat owner, or enter the 6-character code.</div>
     <div style="display:flex;gap:10px;justify-content:flex-end">
       <button class="btn" onclick="closeModal('join-flat-modal')">Cancel</button>
       <button class="btn primary" onclick="joinFlat()">Join Flat</button>
@@ -1136,6 +1136,18 @@ id="page-notifications">
 </div>
 
 <script>
+
+
+
+
+
+
+
+<script>
+
+
+
+
 
 
 
@@ -1403,16 +1415,53 @@ async function startSession(u){
   if(sess.flatId&&ALL_FLATS[sess.flatId]){await switchFlat(sess.flatId);}
   else{const ids=Object.keys(ALL_FLATS);if(ids.length)await switchFlat(ids[0]);else{FLAT=null;MEMBERS=[CU];EXPENSES=[];}}
   await loadNotes();
+  // Process pending join link (if user opened a join link before logging in)
+  const pendingJoin = sessionStorage.getItem('pendingJoin');
+  if(pendingJoin){
+    sessionStorage.removeItem('pendingJoin');
+    try {
+      const flat = JSON.parse(atob(pendingJoin));
+      if(flat.id && flat.name){
+        const existing = await load('fs:flats',{});
+        existing[flat.id] = flat;
+        await save('fs:flats', existing, true);
+        let mems = await wsGet('fs:flat:'+flat.id+':members',[],true) || [];
+        if(!mems.find(m=>m.id===CU.id)){
+          mems.push({id:CU.id,name:CU.name,email:CU.email,
+                     initials:CU.initials,color:CU.color,role:'member',
+                     joinedAt:new Date().toISOString()});
+          await save('fs:flat:'+flat.id+':members',mems,true);
+        }
+        await loadUserFlats();
+        if(ALL_FLATS[flat.id]) await switchFlat(flat.id);
+        toast('✅ Joined "'+flat.name+'" successfully!');
+      }
+    } catch(e){ console.warn('pendingJoin error',e); }
+  }
   updateSidebar();
   showPage('dashboard');
 }
 
 async function loadUserFlats(){
-  const all=await load('fs:flats',{});
+  // Check both local and shared storage for flats this user belongs to
+  const localAll  = lsGet('fs:flats', {}) || {};
+  const sharedAll = await wsGet('fs:flats', {}, true) || {};
+  const combined  = {...localAll, ...sharedAll};
+  // Merge into local storage
+  if(Object.keys(sharedAll).length){
+    const merged = {...localAll, ...sharedAll};
+    lsSet('fs:flats', merged);
+  }
   ALL_FLATS={};
-  for(const[fid,fi]of Object.entries(all)){
-    const mems=await load('fs:flat:'+fid+':members',[]);
-    if(mems.some(m=>m.id===CU.id))ALL_FLATS[fid]=fi;
+  for(const[fid,fi] of Object.entries(combined)){
+    const localMems  = lsGet('fs:flat:'+fid+':members', []) || [];
+    const sharedMems = await wsGet('fs:flat:'+fid+':members', [], true) || [];
+    // Merge members
+    const allMems = [...localMems];
+    for(const sm of sharedMems){
+      if(!allMems.find(m=>m.id===sm.id)) allMems.push(sm);
+    }
+    if(allMems.some(m=>m.id===CU.id)) ALL_FLATS[fid]=fi;
   }
 }
 
@@ -1486,42 +1535,95 @@ async function createFlat(){
   if(!name){toast('Please enter a flat name');return;}
   if(!CU){toast('Please log in first');return;}
   const id='F'+uid8();
-  const code=uid8().slice(0,6);
+  const code=uid8().slice(0,6).toUpperCase();
   const fi={id,name,code,createdBy:CU.id,createdAt:new Date().toISOString()};
-  const all=await load('fs:flats',{});all[id]=fi;await save('fs:flats',all);
+  const all=await load('fs:flats',{});
+  all[id]=fi;
+  // Save with shared=true so other users on same origin can find it
+  await save('fs:flats',all,true);
   const mems=[{id:CU.id,name:CU.name,email:CU.email,initials:CU.initials,color:CU.color,role:'owner',joinedAt:new Date().toISOString()}];
-  await save('fs:flat:'+id+':members',mems);
-  await save('fs:flat:'+id+':expenses',[]);
+  await save('fs:flat:'+id+':members',mems,true);
+  await save('fs:flat:'+id+':expenses',[],true);
   ALL_FLATS[id]=fi;
   await switchFlat(id);
   updateSidebar();
   closeModal('create-flat-modal');
   if(nameEl)nameEl.value='';
-  toast('✅ Flat "'+name+'" created! Code: '+code);
+  toast('✅ Flat "'+name+'" created! Share the invite link with flatmates.');
   reportInited=false;
   renderFlats();renderDashboard();
 }
 
 async function joinFlat(){
   const codeEl=document.getElementById('join-flat-code');
-  const code=(codeEl?codeEl.value:'').trim().toUpperCase();
-  if(!code){toast('Enter an invite code');return;}
-  const all=await load('fs:flats',{});
-  const entry=Object.entries(all).find(([,f])=>f.code===code);
-  if(!entry){toast('❌ Invalid code. Check with your flat owner.');return;}
-  const[fid,fi]=entry;
-  if(ALL_FLATS[fid]){toast('You\'re already in "'+fi.name+'"!');return;}
-  let mems=await load('fs:flat:'+fid+':members',[]);
-  if(!mems.find(m=>m.id===CU.id)){
-    mems.push({id:CU.id,name:CU.name,email:CU.email,initials:CU.initials,color:CU.color,role:'member',joinedAt:new Date().toISOString()});
-    await save('fs:flat:'+fid+':members',mems);
+  const raw=(codeEl?codeEl.value:'').trim();
+  if(!raw){toast('Enter an invite code or paste a join link');return;}
+
+  let fid, fi, importedFlat=false;
+
+  // ── Path A: Full join link pasted (contains encoded flat data) ──
+  // Handles: "https://site.com/#join=BASE64" or just "BASE64..." (long string)
+  let encoded = null;
+  if(raw.includes('#join=')) encoded = raw.split('#join=')[1];
+  else if(raw.length > 20 && !raw.includes(' ')) encoded = raw; // raw base64
+
+  if(encoded){
+    try {
+      const decoded = JSON.parse(atob(encoded.split('#').pop().replace(/\s/g,'')));
+      if(!decoded.id||!decoded.name||!decoded.code) throw new Error('Bad data');
+      fid = decoded.id;
+      fi  = {id:decoded.id, name:decoded.name, code:decoded.code,
+             createdBy:decoded.createdBy, createdAt:decoded.createdAt||new Date().toISOString()};
+      // Save into THIS user's local flat registry
+      const all = await load('fs:flats',{});
+      all[fid] = fi;
+      await save('fs:flats', all, true);
+      importedFlat = true;
+    } catch(err){
+      toast('❌ Invalid join link. Ask the flat owner to share a fresh link.');
+      return;
+    }
   }
-  ALL_FLATS[fid]=fi;
+
+  // ── Path B: 6-char code — search shared + local flat registry ──
+  if(!fid){
+    const code = raw.toUpperCase().replace(/\s/g,'');
+    if(code.length < 4){toast('Code too short. Enter the 6-character code.');return;}
+    // Search shared storage first, then local
+    const sharedAll = await wsGet('fs:flats', {}, true);
+    const localAll  = await load('fs:flats', {});
+    const combined  = {...localAll, ...sharedAll};
+    const entry = Object.entries(combined).find(([,f])=>
+      (f.code||'').toUpperCase() === code
+    );
+    if(!entry){
+      toast('❌ Code not found. Check the code OR ask the owner to share the invite link instead.');
+      return;
+    }
+    [fid, fi] = entry;
+    // Cache in local storage so future loads work
+    const all = await load('fs:flats',{});
+    all[fid] = fi;
+    await save('fs:flats', all, true);
+  }
+
+  if(ALL_FLATS[fid]){toast('You\'re already in "'+fi.name+'"!');return;}
+
+  // Add member
+  let mems = await wsGet('fs:flat:'+fid+':members', [], true);
+  if(!mems || !mems.length) mems = await load('fs:flat:'+fid+':members',[]);
+  if(!mems.find(m=>m.id===CU.id)){
+    mems.push({id:CU.id,name:CU.name,email:CU.email,
+               initials:CU.initials,color:CU.color,role:'member',
+               joinedAt:new Date().toISOString()});
+    await save('fs:flat:'+fid+':members', mems, true);
+  }
+  ALL_FLATS[fid] = fi;
   await switchFlat(fid);
   updateSidebar();
   closeModal('join-flat-modal');
   if(codeEl)codeEl.value='';
-  toast('✅ Joined "'+fi.name+'"!');
+  toast('✅ Joined "'+fi.name+'"!'+(importedFlat?' Expenses will sync once Google Drive is connected.':''));
   reportInited=false;
   renderFlats();renderDashboard();
 }
@@ -4015,6 +4117,47 @@ async function deleteFlagged(id){EXPENSES=EXPENSES.filter(e=>e.id!==id);await sa
 // ═══════════════════════════════════════════════════════════
 //  FLATS
 // ═══════════════════════════════════════════════════════════
+
+// ── Generate encoded join link (works cross-device without backend) ──
+function generateJoinLink(flat){
+  const data = {id:flat.id, name:flat.name, code:flat.code,
+                createdBy:flat.createdBy, createdAt:flat.createdAt};
+  const encoded = btoa(JSON.stringify(data));
+  const base = window.location.origin + window.location.pathname;
+  return base + '#join=' + encoded;
+}
+
+function copyJoinLink(fid){
+  const flat = ALL_FLATS[fid];
+  if(!flat){toast('Flat not found'); return;}
+  const link = generateJoinLink(flat);
+  navigator.clipboard.writeText(link).then(()=>{
+    toast('✅ Join link copied! Share it with flatmates — they open the link and join instantly.');
+  }).catch(()=>{
+    // Fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = link;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('✅ Join link copied!');
+  });
+}
+
+function shareJoinViaWhatsApp(fid){
+  const flat = ALL_FLATS[fid];
+  if(!flat){return;}
+  const link = generateJoinLink(flat);
+  const msg  = encodeURIComponent(
+    '🏠 Join my flat "'+flat.name+'" on Flatshare!\n\n'+
+    '1. Open this link: '+link+'\n'+
+    '2. Register/login\n'+
+    '3. You\'re in! ✅\n\n'+
+    '(Or use code: '+flat.code+')'
+  );
+  window.open('https://wa.me/?text='+msg, '_blank');
+}
 function renderFlats(){
   if(!CU)return;
   updateFlatUI();
@@ -4039,8 +4182,9 @@ function renderFlats(){
         <div style="font-size:12px;color:var(--text2);margin-bottom:14px">Created ${new Date(f.createdAt).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})} · ${isOwner?'Owner':'Member'}</div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           ${!isActive?`<button class="btn sm primary" onclick="switchFlatUI('${fid}')">Switch</button>`:''}
-          <button class="btn sm" onclick="copyFlatCode('${f.code}')">📋 Copy</button>
-          <button class="btn sm" style="background:#25D366;color:#fff;border-color:#25D366" onclick="shareViaWhatsApp('${f.code}','${f.name.replace(/'/g,"\\'")}')">🟢 WhatsApp</button>
+          <button class=\"btn sm\" onclick=\"copyJoinLink(\'${fid}\')\">🔗 Join Link</button>
+          <button class=\"btn sm\" style=\"background:#25D366;color:#fff;border-color:#25D366\" onclick=\"shareJoinViaWhatsApp(\'${fid}\')\">🟢 WhatsApp</button>
+          <button class=\"btn sm\" onclick=\"copyFlatCode(\'${f.code}\')\">📋 Code</button>
           ${isOwner?`<button class="btn sm" onclick="openRenameFlatModal('${fid}','${f.name.replace(/'/g,"\\'")}')">✏️</button>`:''}
           ${isOwner?`<button class="btn sm danger" onclick="deleteFlat('${fid}')">🗑</button>`:''}
           ${!isOwner?`<button class="btn sm danger" onclick="leaveFlat('${fid}')">Leave</button>`:''}
@@ -4188,6 +4332,21 @@ async function initApp(){
       return;
     }
   }
+  // Check URL for join link on page load
+  const hash = window.location.hash;
+  if(hash.startsWith('#join=')){
+    const encoded = hash.slice(6);
+    try {
+      const flat = JSON.parse(atob(encoded));
+      if(flat.id && flat.name){
+        // Store the pending join — will trigger after login
+        sessionStorage.setItem('pendingJoin', encoded);
+        // Clear the hash
+        history.replaceState(null,'',window.location.pathname);
+        toast('📎 Join link detected! Log in to join "'+flat.name+'".');
+      }
+    } catch(e){}
+  }
   // Show login
   document.getElementById('sidebar').style.display='none';
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
@@ -4211,19 +4370,11 @@ initApp();
 
 
 
+
+
+
+
 </script>
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
